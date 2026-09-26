@@ -1,5 +1,5 @@
 // SPY + QQQ Alert Bot — ek hi file. GitHub Actions ise har 5 min chalata hai.
-// SPY: 15M Liquidity Grab + Liquidity Sweep Reversal (15m/1h/4h). QQQ: Liquidity Sweep Reversal (5m/15m).
+// SPY: 15M Liquidity Grab + Sweep Reversal (15m/1h/4h). QQQ: 5M Liquidity Grab (6/6) + 15M Sweep Reversal (Strong volume).
 // src/run.js
 import fs from "node:fs";
 
@@ -74,7 +74,7 @@ var LOOKBACK = 20;
 var RSI_PERIOD = 14;
 var TOL_PCT = 5e-4;
 var MIN_SCORE = 5;
-var REQUIRE_GRAB = false;
+var REQUIRE_GRAB = true;
 var STOP_BUFFER = 0.1;
 var RR = 2;
 var mark = (ok) => ok ? "\u2705" : "\u274C";
@@ -267,18 +267,24 @@ var liq_sweep_reversal_default = {
 };
 
 // src/strategies/qqq-liq-sweep.js
+var MIN_REL_VOL = 1.5;
 var qqq_liq_sweep_default = {
   id: "qqq_liq_sweep",
   name: "QQQ Liquidity Sweep Reversal",
   symbol: "QQQ",
-  timeframes: ["5m", "15m"],
+  timeframes: ["15m"],
+  // 5m pe ab QQQ 5M Liquidity Grab chalti hai
   maxPerDay: 3,
   minConfidence: "Medium",
-  evaluate: liq_sweep_reversal_default.evaluate,
+  evaluate(bars, ctx) {
+    const sig = liq_sweep_reversal_default.evaluate(bars, ctx);
+    if (!sig || !(sig.relVol >= MIN_REL_VOL)) return null;
+    return sig;
+  },
   // QQQ CALL 🟢 (bold) / Price (entry trigger) / Volume
   format(sig) {
     const call = sig.direction === "CALL";
-    const vol = sig.relVol >= 1.5 ? "\u{1F4AA} Strong" : sig.relVol >= 0.8 ? "Normal" : "\u26A0\uFE0F Weak";
+    const vol = `\u{1F4AA} Strong (${sig.relVol.toFixed(1)}x)`;
     return [
       `<b>QQQ ${call ? "CALL \u{1F7E2}" : "PUT \u{1F534}"}</b>`,
       `Price: ${sig.entry.toFixed(2)}`,
@@ -287,14 +293,107 @@ var qqq_liq_sweep_default = {
   }
 };
 
+// src/strategies/qqq-5m-liquidity-grab.js
+var LOOKBACK3 = 20;
+var RSI_PERIOD2 = 14;
+var TOL_PCT2 = 5e-4;
+var MIN_SCORE2 = 6;
+var REQUIRE_GRAB2 = true;
+var VOL_MULT = 1;
+var STOP_BUFFER2 = 0.1;
+var RR2 = 2;
+function qqqGrab(bars, opts = {}) {
+  const o = { REQUIRE_GRAB: REQUIRE_GRAB2, VOL_MULT, MIN_SCORE: MIN_SCORE2, ...opts };
+  if (bars.length < LOOKBACK3 + 3) return null;
+  const r = rsi(bars.map((b) => b.c), RSI_PERIOD2);
+  const i = bars.length - 1, s = i - 1;
+  const sweep = bars[s], next = bars[i];
+  if (r[i] == null || r[i - 1] == null) return null;
+  const prior = bars.slice(s - LOOKBACK3, s);
+  const tol = sweep.c * TOL_PCT2;
+  const avgV = avgVolumeBefore(bars, s, LOOKBACK3) || 1;
+  const relVol = sweep.v / avgV;
+  const volOK = sweep.v > avgV * o.VOL_MULT;
+  const a = atr(bars, 14)[i];
+  const liqLow = Math.min(...prior.map((b) => b.l));
+  const cc = {
+    liq: true,
+    grab: sweep.l <= liqLow + tol,
+    red: sweep.c < sweep.o && sweep.c > liqLow,
+    green: next.c > next.o,
+    rsi: r[i] > r[i - 1],
+    vol: volOK
+  };
+  const cScore = Object.values(cc).filter(Boolean).length;
+  if (cScore >= o.MIN_SCORE && (!o.REQUIRE_GRAB || cc.grab)) {
+    const entry = next.c, stop = Math.min(sweep.l, next.l) - STOP_BUFFER2;
+    return {
+      direction: "CALL",
+      entry,
+      stop,
+      target: entry + RR2 * (entry - stop),
+      confidence: cScore === 6 ? "High" : "Medium",
+      pct: cScore / 6 * 100,
+      relVol,
+      atr: a
+    };
+  }
+  const liqHigh = Math.max(...prior.map((b) => b.h));
+  const nextOK = next.c < next.o && next.c <= sweep.c;
+  if (!nextOK) return null;
+  const pc = {
+    liq: true,
+    grab: sweep.h >= liqHigh - tol,
+    red: sweep.c < sweep.o && sweep.c < liqHigh,
+    next: true,
+    rsi: r[i] < r[i - 1],
+    vol: volOK
+  };
+  const pScore = Object.values(pc).filter(Boolean).length;
+  if (pScore >= o.MIN_SCORE && (!o.REQUIRE_GRAB || pc.grab)) {
+    const entry = next.c, stop = Math.max(sweep.h, next.h) + STOP_BUFFER2;
+    return {
+      direction: "PUT",
+      entry,
+      stop,
+      target: entry - RR2 * (stop - entry),
+      confidence: pScore === 6 ? "High" : "Medium",
+      pct: pScore / 6 * 100,
+      relVol,
+      atr: a
+    };
+  }
+  return null;
+}
+var qqq_5m_liquidity_grab_default = {
+  id: "qqq_5m_liq_grab",
+  name: "QQQ 5M Liquidity Grab",
+  symbol: "QQQ",
+  timeframes: ["5m"],
+  maxPerDay: 3,
+  minConfidence: "Medium",
+  evaluate: (bars) => qqqGrab(bars),
+  format(sig) {
+    const call = sig.direction === "CALL";
+    const vol = sig.relVol >= 1.5 ? "\u{1F4AA} Strong" : sig.relVol >= 0.8 ? "Normal" : "\u26A0\uFE0F Weak";
+    return [
+      `<b>QQQ ${call ? "CALL \u{1F7E2}" : "PUT \u{1F534}"}</b>`,
+      `Price: ${sig.entry.toFixed(2)}`,
+      `Volume: ${vol} (${sig.relVol.toFixed(1)}x)`
+    ].join("\n");
+  }
+};
+
 // src/strategies/index.js
 var strategies_default = [
   spy_15m_liquidity_grab_default,
-  // SPY 15m
+  // SPY 15m  — Liquidity Grab
   liq_sweep_reversal_default,
-  // SPY 15m / 1h / 4h
-  qqq_liq_sweep_default
-  // QQQ 5m / 15m
+  // SPY 15m / 1h / 4h — Sweep Reversal
+  qqq_liq_sweep_default,
+  // QQQ 15m — Sweep Reversal (sirf Strong volume)
+  qqq_5m_liquidity_grab_default
+  // QQQ 5m  — Liquidity Grab (6/6)
 ];
 
 // src/data.js
