@@ -1,0 +1,52 @@
+name: SPY Alerts
+
+on:
+  schedule:
+    - cron: '*/5 13-21 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'test / force / normal'
+        type: choice
+        options: [test, force, normal]
+        default: test
+
+concurrency:
+  group: spy-alerts
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: spy-state-${{ github.run_id }}
+          restore-keys: spy-state-
+
+      - name: Run bot
+        env:
+          RUN_MODE: ${{ github.event.inputs.mode || 'normal' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
+          ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
+          SYMBOL: ${{ vars.SYMBOL || 'SPY' }}
+          DATA_PROVIDER: ${{ vars.DATA_PROVIDER || 'yahoo' }}
+        run: node bot.mjs
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: spy-state-${{ github.run_id }}-${{ github.run_attempt }}
