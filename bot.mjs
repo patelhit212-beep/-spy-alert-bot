@@ -1,6 +1,5 @@
-// SPY Alert Bot — ek hi file. GitHub Actions ise har 5 min chalata hai.
-// Strategies: SPY 15M Liquidity Grab + Liquidity Sweep Reversal CALL/PUT (15m/1h/4h).
-// Alert simple rakhna hai to SHOW_LEVELS = false kar do.
+// SPY + QQQ Alert Bot — ek hi file. GitHub Actions ise har 5 min chalata hai.
+// SPY: 15M Liquidity Grab + Liquidity Sweep Reversal (15m/1h/4h). QQQ: Liquidity Sweep Reversal (5m/15m).
 // src/run.js
 import fs from "node:fs";
 
@@ -267,10 +266,35 @@ var liq_sweep_reversal_default = {
   }
 };
 
+// src/strategies/qqq-liq-sweep.js
+var qqq_liq_sweep_default = {
+  id: "qqq_liq_sweep",
+  name: "QQQ Liquidity Sweep Reversal",
+  symbol: "QQQ",
+  timeframes: ["5m", "15m"],
+  maxPerDay: 3,
+  minConfidence: "Medium",
+  evaluate: liq_sweep_reversal_default.evaluate,
+  // QQQ CALL 🟢 (bold) / Price (entry trigger) / Volume
+  format(sig) {
+    const call = sig.direction === "CALL";
+    const vol = sig.relVol >= 1.5 ? "\u{1F4AA} Strong" : sig.relVol >= 0.8 ? "Normal" : "\u26A0\uFE0F Weak";
+    return [
+      `<b>QQQ ${call ? "CALL \u{1F7E2}" : "PUT \u{1F534}"}</b>`,
+      `Price: ${sig.entry.toFixed(2)}`,
+      `Volume: ${vol}`
+    ].join("\n");
+  }
+};
+
 // src/strategies/index.js
 var strategies_default = [
   spy_15m_liquidity_grab_default,
-  liq_sweep_reversal_default
+  // SPY 15m
+  liq_sweep_reversal_default,
+  // SPY 15m / 1h / 4h
+  qqq_liq_sweep_default
+  // QQQ 5m / 15m
 ];
 
 // src/data.js
@@ -351,11 +375,16 @@ async function getClosedBars(env2, symbol, tf) {
 }
 
 // src/telegram.js
-async function sendTelegram(env2, text) {
+async function sendTelegram(env2, text, parseMode) {
   const res = await fetch(`https://api.telegram.org/bot${env2.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: env2.TELEGRAM_CHAT_ID, text, disable_web_page_preview: true })
+    body: JSON.stringify({
+      chat_id: env2.TELEGRAM_CHAT_ID,
+      text,
+      disable_web_page_preview: true,
+      ...parseMode ? { parse_mode: parseMode } : {}
+    })
   });
   if (!res.ok) throw new Error(`Telegram HTTP ${res.status}: ${await res.text()}`);
 }
@@ -415,26 +444,28 @@ async function main() {
     return;
   }
   const st = loadState();
-  const symbol = env.SYMBOL || "SPY";
+  const defSym = env.SYMBOL || "SPY";
+  const symOf = (s) => s.symbol || defSym;
   const nowSec = Math.floor(Date.now() / 1e3);
-  const tfs = [...new Set(strategies_default.flatMap((s) => s.timeframes))];
-  for (const tf of tfs) {
+  const pairs = [...new Set(strategies_default.flatMap((s) => s.timeframes.map((tf) => `${symOf(s)}|${tf}`)))];
+  for (const pair of pairs) {
+    const [symbol, tf] = pair.split("|");
     let bars;
     try {
       bars = await getClosedBars(env, symbol, tf);
     } catch (e) {
       console.error(tf, e);
-      if (st.errDay[tf] !== now.date) {
-        st.errDay[tf] = now.date;
+      if (st.errDay[pair] !== now.date) {
+        st.errDay[pair] = now.date;
         try {
-          await sendTelegram(env, `\u26A0\uFE0F Data error (${tf}): ${String(e).slice(0, 200)}`);
+          await sendTelegram(env, `\u26A0\uFE0F Data error (${symbol} ${tf}): ${String(e).slice(0, 200)}`);
         } catch {
         }
       }
       continue;
     }
     if (!bars.length) continue;
-    for (const s of strategies_default.filter((s2) => s2.timeframes.includes(tf))) {
+    for (const s of strategies_default.filter((s2) => s2.timeframes.includes(tf) && symOf(s2) === symbol)) {
       const pkey = `${s.id}:${tf}`;
       const lastDone = st.processed[pkey] || 0;
       let idxs = [];
@@ -472,10 +503,10 @@ async function main() {
           console.log(`${s.id} ${tf}: daily limit`);
           continue;
         }
-        let text = formatAlert(symbol, tf, s, sig, bars[i].t);
+        let text = s.format ? s.format(sig, tf) : formatAlert(symbol, tf, s, sig, bars[i].t);
         if (!force && ageMin > 10) text = `\u23F0 ${ageMin} min late
 ` + text;
-        await sendTelegram(env, text);
+        await sendTelegram(env, text, s.format ? "HTML" : void 0);
         if (!force) st.counts[ckey] = count + 1;
         console.log(`${s.id} ${tf}: ${sig.direction} ENTRY sent`);
       }
