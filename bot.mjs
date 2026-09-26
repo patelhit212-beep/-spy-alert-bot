@@ -1,5 +1,6 @@
 // SPY Alert Bot — ek hi file. GitHub Actions ise har 5 min chalata hai.
-// Strategy settings neeche 'spy-15m-liquidity-grab' section mein hain.
+// Strategies: SPY 15M Liquidity Grab + Liquidity Sweep Reversal CALL/PUT (15m/1h/4h).
+// Alert simple rakhna hai to SHOW_LEVELS = false kar do.
 // src/run.js
 import fs from "node:fs";
 
@@ -29,12 +30,6 @@ function nyParts(date = /* @__PURE__ */ new Date()) {
 var nyPartsFromSec = (sec) => nyParts(new Date(sec * 1e3));
 var OPEN_MIN = 9 * 60 + 30;
 var CLOSE_MIN = 16 * 60;
-function fmtET(sec) {
-  const n = nyPartsFromSec(sec);
-  const hh = String(n.hour).padStart(2, "0");
-  const mm = String(n.minute).padStart(2, "0");
-  return `${hh}:${mm} ET`;
-}
 
 // src/indicators.js
 function rsi(closes, period = 14) {
@@ -54,6 +49,18 @@ function rsi(closes, period = 14) {
     gain = (gain * (period - 1) + Math.max(d, 0)) / period;
     loss = (loss * (period - 1) + Math.max(-d, 0)) / period;
     out[i] = loss === 0 ? 100 : 100 - 100 / (1 + gain / loss);
+  }
+  return out;
+}
+function atr(bars, period = 14) {
+  const out = new Array(bars.length).fill(null);
+  const tr = bars.map((b, i) => i === 0 ? b.h - b.l : Math.max(b.h - b.l, Math.abs(b.h - bars[i - 1].c), Math.abs(b.l - bars[i - 1].c)));
+  if (bars.length < period) return out;
+  let prev = tr.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  out[period - 1] = prev;
+  for (let i = period; i < bars.length; i++) {
+    prev = (prev * (period - 1) + tr[i]) / period;
+    out[i] = prev;
   }
   return out;
 }
@@ -97,8 +104,10 @@ function checkCall(bars, r) {
     score,
     entry,
     stop,
+    relVol: sweep.v / (avgVolumeBefore(bars, s, LOOKBACK) || 1),
     target: entry + RR * (entry - stop),
     confidence: score === 6 ? "High" : "Medium",
+    pct: score / 6 * 100,
     notes: `${score}/6 | ${mark(c.liq)} LiqLow ${liqLow.toFixed(2)} ${mark(c.grab)} Grab ${mark(c.red)} Red rejection ${mark(c.green)} Next green ${mark(c.rsi)} RSI up (${r[i].toFixed(1)}) ${mark(c.vol)} Volume`
   };
 }
@@ -126,8 +135,10 @@ function checkPut(bars, r) {
     score,
     entry,
     stop,
+    relVol: sweep.v / (avgVolumeBefore(bars, i, LOOKBACK) || 1),
     target: entry - RR * (stop - entry),
     confidence: score === 6 ? "High" : "Medium",
+    pct: score / 6 * 100,
     notes: `${score}/6 | ${mark(c.liq)} LiqHigh ${liqHigh.toFixed(2)} ${mark(c.grab)} Grab ${mark(c.red)} Red rejection \u2705 Next (auto) ${mark(c.rsi)} RSI down (${r[i].toFixed(1)}) ${mark(c.vol)} Volume`
   };
 }
@@ -140,8 +151,10 @@ var spy_15m_liquidity_grab_default = {
   evaluate(bars) {
     if (bars.length < LOOKBACK + 3) return null;
     const r = rsi(bars.map((b) => b.c), RSI_PERIOD);
+    const a = atr(bars, 14).at(-1);
     const call = checkCall(bars, r);
     const put = checkPut(bars, r);
+    for (const x of [call, put]) if (x) x.atr = a;
     if (call && put) {
       if (call.score === put.score) return null;
       return call.score > put.score ? call : put;
@@ -150,17 +163,144 @@ var spy_15m_liquidity_grab_default = {
   }
 };
 
+// src/strategies/liq-sweep-reversal.js
+var LOOKBACK2 = 40;
+var PIVOT = 2;
+var SWEEP_WINDOW = 5;
+var MIN_BOUNCE_ATR = 0.3;
+var MIN_BODY = 0.5;
+var MIN_CLOSE_LOC = 0.6;
+var REQUIRE_RECLAIM = false;
+var BUF = 0.01;
+var isPivotLow = (b, k) => {
+  for (let j = 1; j <= PIVOT; j++) if (!(b[k].l < b[k - j].l && b[k].l <= b[k + j].l)) return false;
+  return true;
+};
+var isPivotHigh = (b, k) => {
+  for (let j = 1; j <= PIVOT; j++) if (!(b[k].h > b[k - j].h && b[k].h >= b[k + j].h)) return false;
+  return true;
+};
+var strongGreen = (x) => {
+  const r = x.h - x.l;
+  if (r <= 0 || x.c <= x.o) return false;
+  return (x.c - x.o) / r >= MIN_BODY && (x.c - x.l) / r >= MIN_CLOSE_LOC;
+};
+function core(bars) {
+  const i = bars.length - 1, g = bars[i];
+  if (!strongGreen(g)) return null;
+  let s = i;
+  for (let k = i; k >= i - SWEEP_WINDOW; k--) if (bars[k].l < bars[s].l) s = k;
+  for (let k = s + 1; k < i; k++) if (strongGreen(bars[k])) return null;
+  const a = atr(bars, 14)[i];
+  if (!a) return null;
+  let L = null;
+  for (let k = s - PIVOT - 1; k >= Math.max(PIVOT, i - LOOKBACK2); k--) {
+    if (!isPivotLow(bars, k)) continue;
+    const lvl = bars[k].l;
+    if (bars[s].l >= lvl) continue;
+    let untouched = true, hi = -Infinity;
+    for (let m = k + 1; m < s; m++) {
+      if (bars[m].l < lvl) {
+        untouched = false;
+        break;
+      }
+      hi = Math.max(hi, bars[m].h);
+    }
+    if (!untouched || hi - lvl < MIN_BOUNCE_ATR * a) continue;
+    L = lvl;
+    break;
+  }
+  if (L == null) return null;
+  const reclaim = g.c > L;
+  if (REQUIRE_RECLAIM && !reclaim) return null;
+  const entry = g.h + BUF, stop = g.l - BUF, R = entry - stop;
+  let target = null;
+  for (let k = i - PIVOT; k >= Math.max(PIVOT, i - LOOKBACK2 * 2); k--) {
+    if (isPivotHigh(bars, k) && bars[k].h > entry + 0.3 * R && (target == null || bars[k].h < target)) target = bars[k].h;
+  }
+  const fromPivot = target != null;
+  if (!fromPivot) target = entry + 2 * R;
+  return {
+    entry,
+    stop,
+    target,
+    L,
+    sweep: bars[s].l,
+    reclaim,
+    fromPivot,
+    volOK: g.v > avgVolumeBefore(bars, i, 20),
+    rr: (target - entry) / R,
+    relVol: g.v / (avgVolumeBefore(bars, i, 20) || 1),
+    atr: a
+  };
+}
+var mirror = (bars) => bars.map((b) => ({ ...b, o: -b.o, h: -b.l, l: -b.h, c: -b.c }));
+var liq_sweep_reversal_default = {
+  id: "liq_sweep_reversal",
+  name: "Liquidity Sweep Reversal",
+  timeframes: ["15m", "1h", "4h"],
+  maxPerDay: 3,
+  minConfidence: "Medium",
+  evaluate(bars) {
+    if (bars.length < 30) return null;
+    let r = core(bars), direction = "CALL";
+    if (!r) {
+      const m = core(mirror(bars));
+      if (!m) return null;
+      direction = "PUT";
+      r = { ...m, entry: -m.entry, stop: -m.stop, target: -m.target, L: -m.L, sweep: -m.sweep };
+    }
+    const call = direction === "CALL";
+    const f = (x) => x.toFixed(2);
+    return {
+      direction,
+      entry: r.entry,
+      stop: r.stop,
+      target: r.target,
+      relVol: r.relVol,
+      atr: r.atr,
+      confidence: r.reclaim && r.volOK ? "High" : "Medium",
+      // % = kitne checks pass hue (jeetne ki probability NAHI)
+      pct: 50 + (r.reclaim ? 15 : 0) + (r.volOK ? 15 : 0) + (r.rr >= 1.5 ? 10 : 0) + (r.fromPivot ? 10 : 0),
+      notes: `Liquidity ${f(r.L)} \u2192 sweep ${call ? "low" : "high"} ${f(r.sweep)} \u2192 ${call ? "green" : "red"} candle. Entry sirf ${f(r.entry)} ${call ? "upar" : "neeche"} tootne pe! | Reclaim ${r.reclaim ? "\u2705" : "\u274C"} | Volume ${r.volOK ? "\u2705" : "\u274C"} | TP = ${r.fromPivot ? `next liquidity (swing ${call ? "high" : "low"})` : "2R"} | R:R 1:${r.rr.toFixed(1)}`
+    };
+  }
+};
+
 // src/strategies/index.js
 var strategies_default = [
-  spy_15m_liquidity_grab_default
+  spy_15m_liquidity_grab_default,
+  liq_sweep_reversal_default
 ];
 
 // src/data.js
 var TF = {
   "5m": { sec: 300, yahoo: "5m", range: "5d", alpaca: "5Min", days: 7 },
   "15m": { sec: 900, yahoo: "15m", range: "10d", alpaca: "15Min", days: 14 },
-  "1h": { sec: 3600, yahoo: "60m", range: "1mo", alpaca: "1Hour", days: 40 }
+  "1h": { sec: 3600, yahoo: "60m", range: "1mo", alpaca: "1Hour", days: 40 },
+  // 4h: Yahoo mein nahi hota — 1h candles jod ke banate hain (9:30-13:30, 13:30-16:00 ET)
+  "4h": { sec: 14400, yahoo: "60m", range: "3mo", alpaca: "1Hour", days: 90, from1h: true }
 };
+function to4h(bars) {
+  const out = [];
+  let cur = null, key = null;
+  for (const b of bars) {
+    const n = nyPartsFromSec(b.t);
+    const k = n.date + ":" + Math.floor((n.minOfDay - OPEN_MIN) / 240);
+    if (k !== key) {
+      if (cur) out.push(cur);
+      key = k;
+      cur = { ...b };
+    } else {
+      cur.h = Math.max(cur.h, b.h);
+      cur.l = Math.min(cur.l, b.l);
+      cur.c = b.c;
+      cur.v += b.v;
+    }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
 async function fetchYahoo(symbol, tf) {
   const c = TF[tf];
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=${c.yahoo}&range=${c.range}&includePrePost=false`;
@@ -200,7 +340,8 @@ async function fetchAlpaca(env2, symbol, tf) {
   });
 }
 async function getClosedBars(env2, symbol, tf) {
-  const bars = env2.DATA_PROVIDER === "alpaca" ? await fetchAlpaca(env2, symbol, tf) : await fetchYahoo(symbol, tf);
+  let bars = env2.DATA_PROVIDER === "alpaca" ? await fetchAlpaca(env2, symbol, tf) : await fetchYahoo(symbol, tf);
+  if (TF[tf].from1h) bars = to4h(bars);
   if (!bars.length) return bars;
   const nowSec = Math.floor(Date.now() / 1e3);
   const marketStillOpen = nyParts().minOfDay < CLOSE_MIN;
@@ -218,24 +359,27 @@ async function sendTelegram(env2, text) {
   });
   if (!res.ok) throw new Error(`Telegram HTTP ${res.status}: ${await res.text()}`);
 }
-var $ = (x) => `$${Number(x).toFixed(2)}`;
-function formatAlert(symbol, tf, strategy, sig, candleT) {
-  const tag = sig.direction === "CALL" ? "\u{1F7E2} CALL \u2014 ENTRY" : "\u{1F534} PUT \u2014 ENTRY";
-  const strike = `${Math.round(sig.entry)}${sig.direction === "CALL" ? "C" : "P"}`;
+var SHOW_LEVELS = true;
+var TF_LABEL = { "5m": "5 MIN", "15m": "15 MIN", "1h": "1 HOUR", "4h": "4 HOUR" };
+function volLabel(rv) {
+  if (rv == null || !isFinite(rv)) return null;
+  const tag = rv >= 1.5 ? "\u{1F4AA} Strong" : rv >= 0.8 ? "Normal" : "\u26A0\uFE0F Weak";
+  return `\u{1F50A} Volume: ${tag} (${rv.toFixed(1)}x)`;
+}
+function formatAlert(symbol, tf, strategy, sig) {
+  const call = sig.direction === "CALL";
+  const pct = sig.pct ?? (sig.confidence === "High" ? 80 : sig.confidence === "Medium" ? 60 : 40);
   const lines = [
-    tag,
-    "",
-    `\u2022 Ticker: ${symbol}`,
-    `\u2022 Strategy: ${strategy.name} (${tf})`,
-    `\u2022 Entry: ${$(sig.entry)}`,
-    `\u2022 Stop-loss: ${$(sig.stop)}`,
-    `\u2022 Target: ${$(sig.target)}`,
-    `\u2022 Strike (approx ATM): ${strike}`,
-    `\u2022 Confidence: ${sig.confidence}`,
-    `\u2022 Candle: ${fmtET(candleT)}`
+    symbol,
+    call ? "\u{1F7E2} BUY CALL" : "\u{1F534} BUY PUT",
+    `\u23F1 ${TF_LABEL[tf] || tf}`,
+    `\u{1F4CA} ${Math.round(pct)}%`
   ];
-  if (sig.notes) lines.push(`\u2022 Info: ${sig.notes}`);
-  lines.push("", "\u26A0\uFE0F Not financial advice \u2014 chart khud check karke trade lena.");
+  const v = volLabel(sig.relVol);
+  if (v) lines.push(v);
+  if (SHOW_LEVELS) {
+    lines.push("", `Entry ${sig.entry.toFixed(2)} | SL ${sig.stop.toFixed(2)} | TP ${sig.target.toFixed(2)}`);
+  }
   return lines.join("\n");
 }
 
@@ -329,8 +473,7 @@ async function main() {
           continue;
         }
         let text = formatAlert(symbol, tf, s, sig, bars[i].t);
-        if (!force && ageMin > 10) text = `\u23F1 Late alert: candle ${ageMin} min pehle close hui (GitHub delay)
-
+        if (!force && ageMin > 10) text = `\u23F0 ${ageMin} min late
 ` + text;
         await sendTelegram(env, text);
         if (!force) st.counts[ckey] = count + 1;
