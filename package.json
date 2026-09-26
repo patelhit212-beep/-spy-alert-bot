@@ -1,0 +1,13 @@
+{
+  "name": "spy-alert-bot",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --test-scheduled",
+    "deploy": "wrangler deploy",
+    "logs": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

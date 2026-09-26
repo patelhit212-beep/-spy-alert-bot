@@ -1,0 +1,17 @@
+name = "spy-alert-bot"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+# Cron UTC mein chalta hai. 13-21 UTC = EDT aur EST dono cover.
+# Har 5 min, candle close hone ke 1 min baad (x:01, x:06, x:11 ...).
+# Asli market-hours check (9:30-4:00 PM ET) code ke andar hota hai.
+[triggers]
+crons = ["1,6,11,16,21,26,31,36,41,46,51,56 13-21 * * 1-5"]
+
+[[kv_namespaces]]
+binding = "STATE"
+id = "PASTE_YOUR_KV_ID_HERE"
+
+[vars]
+SYMBOL = "SPY"
+DATA_PROVIDER = "yahoo"   # "yahoo" (free, no key) ya "alpaca" (free key chahiye)
