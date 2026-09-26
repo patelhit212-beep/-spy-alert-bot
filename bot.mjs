@@ -464,6 +464,10 @@ async function fetchAlpaca(env2, symbol, tf) {
 }
 async function getClosedBars(env2, symbol, tf) {
   let bars = env2.DATA_PROVIDER === "alpaca" ? await fetchAlpaca(env2, symbol, tf) : await fetchYahoo(symbol, tf);
+  bars = bars.filter((b) => {
+    const m = nyPartsFromSec(b.t).minOfDay;
+    return m >= OPEN_MIN - 30 && m < CLOSE_MIN;
+  });
   if (TF[tf].from1h) bars = to4h(bars);
   if (!bars.length) return bars;
   const nowSec = Math.floor(Date.now() / 1e3);
